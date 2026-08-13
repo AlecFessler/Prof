@@ -35,3 +35,35 @@ pub fn init(
     }
     return self;
 }
+
+pub fn drain(self: EventParser, cpu: u64) !void {
+    // the kernel writes ring_head concurrently, so an atomic acquire is necessary
+    const ring_head = @atomicLoad(u64, &self.ring_headers[cpu].data_head, .acquire);
+    // only we write ring_tail, so a standard load is sufficient
+    const ring_tail = self.ring_headers[cpu].data_tail;
+    const available_bytes = ring_head - ring_tail;
+    if (available_bytes == 0) return;
+    std.debug.assert(available_bytes <= self.ring_n_bytes);
+
+    const offset = ring_tail & (self.ring_n_bytes - 1);
+    const bytes_before_wraparound = self.ring_n_bytes - offset;
+    const first_chunk_bytes = @min(available_bytes, bytes_before_wraparound);
+    @memcpy(
+        self.scratch[0..first_chunk_bytes],
+        self.ring_buffers[cpu][offset..][0..first_chunk_bytes],
+    );
+    if (available_bytes > first_chunk_bytes) {
+        @memcpy(
+            self.scratch[first_chunk_bytes..available_bytes],
+            self.ring_buffers[cpu][0 .. available_bytes - first_chunk_bytes],
+        );
+    }
+
+    // atomic release is necessary to ensure the copy from the ring buffer to
+    // the scratch buffer is not reordered after the following ring_tail bump
+    @atomicStore(u64, &self.ring_headers[cpu].data_tail, ring_head, .release);
+
+    //try self.parseRecords(self.scratch[0..available_bytes]);
+}
+
+//pub fn parseRecords(self: *EventParser, records_bytes: []const u8) !void {}
