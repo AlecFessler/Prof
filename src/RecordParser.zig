@@ -6,7 +6,7 @@ const std = @import("std");
 // bits of information such as where the ring-buffer head is."
 pub const N_DATA_PAGES = 1 << 7; // 128
 
-const EventParser = @This();
+const RecordParser = @This();
 
 ring_headers: []*std.os.linux.perf_event_mmap_page,
 ring_buffers: [][*]u8,
@@ -20,9 +20,9 @@ pub fn init(
     allocator: std.mem.Allocator,
     perf_event_ring_addrs: [][*]align(std.heap.page_size_min) u8,
     target_pid: std.os.linux.pid_t,
-) !EventParser {
+) !RecordParser {
     const ring_n_bytes = N_DATA_PAGES * std.heap.pageSize();
-    const self: EventParser = .{
+    const self: RecordParser = .{
         .ring_headers = try allocator.alloc(*std.os.linux.perf_event_mmap_page, perf_event_ring_addrs.len),
         .ring_buffers = try allocator.alloc([*]u8, perf_event_ring_addrs.len),
         .ring_n_bytes = ring_n_bytes,
@@ -36,13 +36,12 @@ pub fn init(
     return self;
 }
 
-pub fn drain(self: EventParser, cpu: u64) !void {
+pub fn drain(self: RecordParser, cpu: u64) ![]const u8 {
     // the kernel writes ring_head concurrently, so an atomic acquire is necessary
     const ring_head = @atomicLoad(u64, &self.ring_headers[cpu].data_head, .acquire);
     // only we write ring_tail, so a standard load is sufficient
     const ring_tail = self.ring_headers[cpu].data_tail;
     const available_bytes = ring_head - ring_tail;
-    if (available_bytes == 0) return;
     std.debug.assert(available_bytes <= self.ring_n_bytes);
 
     const offset = ring_tail & (self.ring_n_bytes - 1);
@@ -63,7 +62,7 @@ pub fn drain(self: EventParser, cpu: u64) !void {
     // the scratch buffer is not reordered after the following ring_tail bump
     @atomicStore(u64, &self.ring_headers[cpu].data_tail, ring_head, .release);
 
-    //try self.parseRecords(self.scratch[0..available_bytes]);
+    return self.scratch[0..available_bytes];
 }
 
-//pub fn parseRecords(self: *EventParser, records_bytes: []const u8) !void {}
+//pub fn parseRecords(self: *RecordParser, records_bytes: []const u8) !void {}

@@ -1,12 +1,12 @@
 // TODO:
-// implement EventParser .drain(), .parseRecords(), .recordSample(), .report()
+// implement RecordParser .drain(), .parseRecords(), .recordSample(), .report()
 // full callchain stack unwind instead of leaf only
 // mmap2 records to handle PIE binaries and shared libs
 
 const linux_error = @import("linux_error");
 const std = @import("std");
 const cmdline = @import("cmdline.zig");
-const EventParser = @import("EventParser.zig");
+const RecordParser = @import("RecordParser.zig");
 
 const Io = std.Io;
 
@@ -14,7 +14,7 @@ const checkLinuxError = linux_error.check;
 const checkLinuxFd = linux_error.checkFd;
 const parseCmdline = cmdline.parseCmdline;
 
-const N_DATA_PAGES = EventParser.N_DATA_PAGES;
+const N_DATA_PAGES = RecordParser.N_DATA_PAGES;
 
 const LOOP_UPPER_BOUND = 50000;
 
@@ -42,11 +42,93 @@ pub fn main(init: std.process.Init) !void {
     var perf_event_ring_addrs: [][*]align(std.heap.page_size_min) u8 = undefined;
     epoll_fd, perf_event_ring_addrs = try setupPerfMonitoring(arena, target_pid);
 
+    const record_parser = try RecordParser.init(arena, perf_event_ring_addrs, target_pid);
+
     // resume the forked process to execve to the target binary
     try checkLinuxError(std.os.linux.kill(target_pid, std.os.linux.SIG.CONT));
 
-    const event_parser = try EventParser.init(arena, perf_event_ring_addrs, target_pid);
-    _ = event_parser;
+    const n_cpus = try std.Thread.getCpuCount();
+    var events = try arena.alloc(std.os.linux.epoll_event, n_cpus);
+
+    // This one loop is intentionally unbounded because the profiler
+    // is intended to be capable of streaming samples indefinitely,
+    // or until the target exits for whatever reason
+    while (true) {
+        const max_wait_ms = 1000;
+        const n_events = try waitForEvents(epoll_fd, events, max_wait_ms);
+
+        // either a full epoll cycle passed with no output,
+        // or the inner waitForEvents inner loop hit LOOP_UPPER_BOUND
+        if (n_events == 0 and (try checkTargetGone(target_pid))) {
+            break;
+        }
+
+        var hung_up = false;
+        for (events[0..n_events]) |ev| {
+            if (eventIsRecordable(ev.events)) {
+                const cpu = ev.data.u32;
+                const drained_records = try record_parser.drain(cpu);
+                _ = drained_records;
+            }
+            hung_up = epollHungUp(ev.events);
+        }
+
+        if (hung_up or record_parser.saw_exit) {
+            break;
+        }
+    }
+
+    // flush any remaining records that may exist
+    for (0..n_cpus) |cpu| {
+        const drained_records = try record_parser.drain(cpu);
+        _ = drained_records;
+    }
+}
+
+fn eventIsRecordable(events: u32) bool {
+    return (events & std.os.linux.EPOLL.IN) != 0;
+}
+
+fn epollHungUp(events: u32) bool {
+    return events & (std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.ERR) != 0;
+}
+
+fn checkTargetGone(target_pid: std.os.linux.pid_t) !bool {
+    var iterations: u32 = 0;
+    while (iterations < LOOP_UPPER_BOUND) : (iterations += 1) {
+        var status: u32 = 0;
+        const rc = std.os.linux.waitpid(target_pid, &status, std.os.linux.W.NOHANG);
+        if (std.os.linux.errno(rc) == .INTR) continue;
+        try checkLinuxError(rc);
+        return (rc != 0);
+    }
+    std.debug.assert(iterations < LOOP_UPPER_BOUND);
+    return true;
+}
+
+fn waitForEvents(
+    epoll_fd: i32,
+    events: []std.os.linux.epoll_event,
+    max_wait_ms: usize,
+) !usize {
+    // Returns if either the inner loop executes LOOP_UPPER_BOUND times,
+    // which is unexpected, and thus asserted against in debug builds.
+    // In release, if this condition is hit for whatever reason, the
+    // profiler won't get stuck in an infinite loop.
+    var iterations: u32 = 0;
+    while (iterations < LOOP_UPPER_BOUND) : (iterations += 1) {
+        const n_events = std.os.linux.epoll_wait(
+            epoll_fd,
+            events.ptr,
+            @intCast(events.len),
+            @intCast(max_wait_ms),
+        );
+        if (std.os.linux.errno(n_events) == .INTR) continue;
+        try checkLinuxError(n_events);
+        return n_events;
+    }
+    std.debug.assert(iterations < LOOP_UPPER_BOUND);
+    return 0;
 }
 
 // Setup performance montoring for the target per-cpu.
