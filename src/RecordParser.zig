@@ -30,13 +30,13 @@ pub fn init(
         .scratch = try allocator.alloc(u8, ring_n_bytes),
     };
     for (0..perf_event_ring_addrs.len) |i| {
-        self.ring_headers[i] = @ptrCast(@alignCast(perf_event_ring_addrs[i]));
-        self.ring_buffers[i] = @ptrCast(@alignCast(perf_event_ring_addrs[i] + std.heap.pageSize()));
+        self.ring_headers[i] = @ptrCast(perf_event_ring_addrs[i]);
+        self.ring_buffers[i] = @ptrCast(perf_event_ring_addrs[i] + std.heap.pageSize());
     }
     return self;
 }
 
-pub fn drain(self: RecordParser, cpu: u64) ![]const u8 {
+pub fn drain(self: *RecordParser, cpu: u64) ![]const u8 {
     // the kernel writes ring_head concurrently, so an atomic acquire is necessary
     const ring_head = @atomicLoad(u64, &self.ring_headers[cpu].data_head, .acquire);
     // only we write ring_tail, so a standard load is sufficient
@@ -102,7 +102,7 @@ pub fn parseRecords(self: *RecordParser, records_bytes: []const u8) !void {
             .SAMPLE => {
                 // sample_type is CALLCHAIN only, so the body is a u64 frame
                 // count followed by that many instruction pointers, leaf first
-                std.debug.assert(body.len > @sizeOf(u64));
+                std.debug.assert(body.len >= @sizeOf(u64));
                 const n_frames: u64 = @bitCast(body[0..@sizeOf(u64)].*);
                 const ips_end = @sizeOf(u64) + n_frames * @sizeOf(u64);
                 std.debug.assert(body.len >= ips_end);

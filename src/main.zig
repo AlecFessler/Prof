@@ -1,7 +1,8 @@
 // TODO:
-// implement RecordParser .drain(), .parseRecords(), .recordSample(), .report()
-// full callchain stack unwind instead of leaf only
+// implement symbolization
 // mmap2 records to handle PIE binaries and shared libs
+// set a watermark of a few kb to wakeup fewer times
+// pass the target a real env/args
 
 const linux_error = @import("linux_error");
 const std = @import("std");
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
                 const drained_records = try record_parser.drain(cpu);
                 try record_parser.parseRecords(drained_records);
             }
-            hung_up = epollHungUp(ev.events);
+            hung_up = hung_up or epollHungUp(ev.events);
         }
 
         if (hung_up or record_parser.saw_exit) {
@@ -143,7 +144,7 @@ fn setupPerfMonitoring(
     var perf_event_attr: std.os.linux.perf_event_attr = .{};
     perf_event_attr.type = .HARDWARE;
     perf_event_attr.config = @intFromEnum(std.os.linux.PERF.COUNT.HW.CPU_CYCLES);
-    perf_event_attr.sample_period_or_freq = 999; // sample every 999 cpu cycles
+    perf_event_attr.sample_period_or_freq = 999; // sample at 999hz
     perf_event_attr.wakeup_events_or_watermark = 1; // wakeup every n events
     perf_event_attr.flags = .{
         .disabled = true, // start disabled
@@ -228,8 +229,9 @@ fn forkAndWait(target_path: [:0]const u8) !std.os.linux.pid_t {
             const argv = [_:null]?[*:0]const u8{target_path.ptr};
             const env = [_:null]?[*:0]const u8{};
 
-            // execve only returns if there was an error
-            try checkLinuxError(std.os.linux.execve(target_path, &argv, &env));
+            _ = std.os.linux.execve(target_path, &argv, &env);
+            // execve only returns if an error occurred
+            std.os.linux.exit_group(127);
         }
     }
 
