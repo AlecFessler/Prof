@@ -49,7 +49,7 @@ pub fn drain(self: RecordParser, cpu: u64) ![]const u8 {
     const first_chunk_bytes = @min(available_bytes, bytes_before_wraparound);
     @memcpy(
         self.scratch[0..first_chunk_bytes],
-        self.ring_buffers[cpu][offset..][0..first_chunk_bytes],
+        self.ring_buffers[cpu][offset .. offset + first_chunk_bytes],
     );
     if (available_bytes > first_chunk_bytes) {
         @memcpy(
@@ -65,4 +65,76 @@ pub fn drain(self: RecordParser, cpu: u64) ![]const u8 {
     return self.scratch[0..available_bytes];
 }
 
-//pub fn parseRecords(self: *RecordParser, records_bytes: []const u8) !void {}
+// The kernel splices PERF_CONTEXT_* markers into the callchain to delimit
+// its user/kernel/hypervisor portions. They are all negative when read as
+// an i64, so any entry at or above PERF_CONTEXT_MAX is a marker, not an ip.
+const PERF_CONTEXT_MAX: u64 = @bitCast(@as(i64, -4095));
+
+const RecordLost = extern struct {
+    id: u64,
+    lost: u64,
+};
+
+const RecordThrottle = extern struct {
+    time: u64,
+    id: u64,
+    stream_id: u64,
+};
+
+const RecordExit = extern struct {
+    pid: u32,
+    ppid: u32,
+    tid: u32,
+    ptid: u32,
+    time: u64,
+};
+
+pub fn parseRecords(self: *RecordParser, records_bytes: []const u8) !void {
+    const header_size = @sizeOf(std.os.linux.perf_event_header);
+    var offset: usize = 0;
+    while (offset + header_size <= records_bytes.len) {
+        const header: *align(1) const std.os.linux.perf_event_header = @ptrCast(&records_bytes[offset]);
+        std.debug.assert(header.size != 0);
+        std.debug.assert(offset + header.size <= records_bytes.len);
+
+        const body = records_bytes[offset + header_size .. offset + header.size];
+        switch (header.type) {
+            .SAMPLE => {
+                // sample_type is CALLCHAIN only, so the body is a u64 frame
+                // count followed by that many instruction pointers, leaf first
+                std.debug.assert(body.len > @sizeOf(u64));
+                const n_frames: u64 = @bitCast(body[0..@sizeOf(u64)].*);
+                const ips_end = @sizeOf(u64) + n_frames * @sizeOf(u64);
+                std.debug.assert(body.len >= ips_end);
+
+                const ips = std.mem.bytesAsSlice(u64, body[@sizeOf(u64)..ips_end]);
+                std.debug.print("sample: {} frames\n", .{n_frames});
+                for (ips) |ip| {
+                    if (ip >= PERF_CONTEXT_MAX) continue;
+                    std.debug.print("  0x{x}\n", .{ip});
+                }
+            },
+            .LOST => {
+                if (body.len < @sizeOf(RecordLost)) break;
+                const record: *align(1) const RecordLost = @ptrCast(body.ptr);
+                self.lost_samples += record.lost;
+            },
+            .THROTTLE, .UNTHROTTLE => {
+                std.debug.print("Throttle/unthrottle event\n", .{});
+            },
+            .EXIT => {
+                if (body.len < @sizeOf(RecordExit)) break;
+                const record: *align(1) const RecordExit = @ptrCast(body.ptr);
+                if (record.pid == record.tid and record.pid == self.target_pid) {
+                    self.saw_exit = true;
+                }
+                std.debug.print("Parser saw exit event\n", .{});
+            },
+            .FORK => {
+                std.debug.print("Fork event\n", .{});
+            },
+            else => {},
+        }
+        offset += header.size;
+    }
+}

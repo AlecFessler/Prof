@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     var perf_event_ring_addrs: [][*]align(std.heap.page_size_min) u8 = undefined;
     epoll_fd, perf_event_ring_addrs = try setupPerfMonitoring(arena, target_pid);
 
-    const record_parser = try RecordParser.init(arena, perf_event_ring_addrs, target_pid);
+    var record_parser = try RecordParser.init(arena, perf_event_ring_addrs, target_pid);
 
     // resume the forked process to execve to the target binary
     try checkLinuxError(std.os.linux.kill(target_pid, std.os.linux.SIG.CONT));
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
             if (eventIsRecordable(ev.events)) {
                 const cpu = ev.data.u32;
                 const drained_records = try record_parser.drain(cpu);
-                _ = drained_records;
+                try record_parser.parseRecords(drained_records);
             }
             hung_up = epollHungUp(ev.events);
         }
@@ -81,8 +81,10 @@ pub fn main(init: std.process.Init) !void {
     // flush any remaining records that may exist
     for (0..n_cpus) |cpu| {
         const drained_records = try record_parser.drain(cpu);
-        _ = drained_records;
+        try record_parser.parseRecords(drained_records);
     }
+
+    std.debug.print("Total lost samples: {}\n", .{record_parser.lost_samples});
 }
 
 fn eventIsRecordable(events: u32) bool {
